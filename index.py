@@ -3,6 +3,7 @@ import re
 import io
 import csv
 import json
+import html as html_lib
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -45,8 +46,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URL splitter — preserves auth key
-# ─────────────────────────────────────────────────────────────────────────────
 def split_url(raw: str):
     u = urlparse(raw.strip())
     query = dict(parse_qsl(u.query))
@@ -67,8 +66,6 @@ def build_endpoint(base: str, path: str, query: dict):
         url += "?" + urlencode(query)
     return url
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Indian phone normalization
 # ─────────────────────────────────────────────────────────────────────────────
 def normalize_indian(raw) -> str | None:
     raw = str(raw).strip()
@@ -97,9 +94,7 @@ def normalize_indian(raw) -> str | None:
             return "+91" + local
     return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Panel-native status check — `!!S.status`
-# ─────────────────────────────────────────────────────────────────────────────
+
 def is_online(device) -> bool:
     if not isinstance(device, dict):
         return False
@@ -110,9 +105,7 @@ def is_online(device) -> bool:
         return True
     return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phone extraction — mobNo → sims[0].phoneNumber
-# ─────────────────────────────────────────────────────────────────────────────
+
 def get_device_phone(device) -> str | None:
     phone = device.get("mobNo")
     if phone and str(phone).strip():
@@ -135,8 +128,6 @@ def get_device_phone(device) -> str | None:
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fetch
-# ─────────────────────────────────────────────────────────────────────────────
 async def fetch_json(session, url: str):
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
@@ -154,9 +145,7 @@ async def fetch_json(session, url: str):
     except Exception as e:
         return None, str(e)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scan
-# ─────────────────────────────────────────────────────────────────────────────
+
 async def scan_panel(session, raw_url: str):
     base, query = split_url(raw_url)
 
@@ -222,91 +211,87 @@ async def scan_all(urls: list[str]):
     return {"per_url": per_url, "unique": sorted(global_unique), "count": len(global_unique)}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Telegram helpers
-# ─────────────────────────────────────────────────────────────────────────────
 def menu_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("📖 How to scan", callback_data="help")]])
 
-async def send_rich(context, chat_id, html, keyboard=None):
+
+def esc(t) -> str:
+    return html_lib.escape(str(t), quote=False)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPORT — classic HTML + <blockquote expandable> for collapsible
+# ─────────────────────────────────────────────────────────────────────────────
+def build_report(result) -> str:
+    parts = [
+        "<b>📊 SCAN COMPLETE</b>",
+        f"<b>Panels:</b> {len(result['per_url'])}",
+        f"<b>Total unique numbers:</b> {result['count']}",
+        "",
+    ]
+
+    for url, r in result["per_url"].items():
+        short = url.replace("https://", "").split("?")[0].replace(".firebaseio.com", "")
+        parts.append(f"<b>🔗 {esc(short)}</b>")
+        parts.append(f"<i>{r['count']} numbers · {r['online']} online · {r['total']} devices</i>")
+
+        if r["error"]:
+            parts.append(f"<i>⚠️ {esc(r['error'])}</i>")
+        elif r["phones"]:
+            header = f"📱 {r['count']} numbers (tap to expand)"
+            body_lines = [esc(n) for n in r["phones"]]
+            body = "\n".join(body_lines)
+            parts.append(f"<blockquote expandable>{header}\n{body}</blockquote>")
+        else:
+            parts.append("<i>No valid numbers found.</i>")
+
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+async def send_html(context, chat_id, html: str, keyboard=None):
     try:
-        await context.bot.send_rich_message(
-            chat_id=chat_id,
-            rich_message={"html": html},
-            reply_markup=keyboard,
-        )
-    except Exception as exc:
-        logger.warning("rich message failed (%s), falling back to classic", exc)
         await context.bot.send_message(
             chat_id=chat_id,
             text=html,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
+            disable_web_page_preview=True,
         )
-
-def escape(t):
-    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RICH REPORT BUILDER — numbers under each link, collapsible
-# ─────────────────────────────────────────────────────────────────────────────
-def build_rich_report(result) -> str:
-    parts = []
-    parts.append("<h2>📊 SCAN COMPLETE</h2>")
-    parts.append(f"<p><b>Panels:</b> {len(result['per_url'])}</p>")
-    parts.append(f"<p><b>Total unique numbers:</b> <mark>{result['count']}</mark></p>")
-    parts.append("<hr/>")
-
-    for url, r in result["per_url"].items():
-        short = url.replace("https://", "").split("?")[0].replace(".firebaseio.com", "")
-        parts.append(f"<h3>🔗 {escape(short)}</h3>")
-        parts.append(
-            f"<p><b>{r['count']}</b> numbers · "
-            f"<i>{r['online']} online</i> · "
-            f"{r['total']} devices</p>"
-        )
-
-        if r["error"]:
-            parts.append(f"<p><i>⚠️ {escape(r['error'])}</i></p>")
-        elif r["phones"]:
-            parts.append("<details>")
-            parts.append(f"<summary>📱 Show all {r['count']} numbers</summary>")
-            parts.append("<ul>")
-            for n in r["phones"]:
-                parts.append(f"<li>{escape(n)}</li>")
-            parts.append("</ul>")
-            parts.append("</details>")
-        else:
-            parts.append("<p><i>No valid numbers found.</i></p>")
-
-        parts.append("<hr/>")
-
-    return "\n".join(parts)
+    except Exception as exc:
+        logger.exception("send_html failed: %s", exc)
+        # last-ditch plain text fallback
+        stripped = re.sub(r"<[^>]+>", "", html)
+        await context.bot.send_message(chat_id=chat_id, text=stripped[:4000])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Handlers
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = (
-        "<h2>📡 Panel Number Extractor</h2>"
-        "<p><i>Rich UI · collapsible lists · +91 only</i></p>"
-        "<p>Paste Firebase panel URL(s), one per line.</p>"
-        "<p>Include <code>?auth=KEY</code> if needed.</p>"
-        "<hr/>"
-        "<p>I read <code>clients</code> → keep <code>status: true</code> → "
-        "extract <code>mobNo</code> → filter valid +91.</p>"
-        "<p>Numbers appear <b>under each link</b> in a collapsible list.</p>"
+        "<b>📡 Panel Number Extractor</b>\n"
+        "<i>collapsible lists · +91 only</i>\n\n"
+        "Paste Firebase panel URL(s), one per line.\n"
+        "Include <code>?auth=KEY</code> if needed.\n\n"
+        "I read <code>clients</code> → keep <code>status: true</code> → "
+        "extract <code>mobNo</code> → filter valid +91.\n\n"
+        "Numbers appear <b>under each link</b> in a tap-to-expand block."
     )
-    await send_rich(context, update.effective_chat.id, html, menu_keyboard())
+    await send_html(context, update.effective_chat.id, html, menu_keyboard())
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
+
 
 async def help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await cmd_start(update, context)
 
+
 URL_RE = re.compile(r"https?://[^\s\)\]\>,]+", re.IGNORECASE)
+
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -321,18 +306,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id, f"Scanning <b>{len(urls)}</b> panel(s)…", parse_mode=ParseMode.HTML,
     )
 
-    result = await scan_all(urls)
+    try:
+        result = await scan_all(urls)
+    except Exception as exc:
+        logger.exception("scan_all failed: %s", exc)
+        await ack.edit_text("Scan failed. Check URL format and auth key.")
+        return
 
     try:
         await ack.delete()
     except Exception:
         pass
 
-    # Rich report
-    rich_html = build_rich_report(result)
-    await send_rich(context, chat_id, rich_html)
+    report = build_report(result)
+    await send_html(context, chat_id, report)
 
-    # CSV
     if result["count"]:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         buf = io.StringIO()
@@ -357,7 +345,8 @@ tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "rich-panel", "alias": VERCEL_URL}
+    return {"status": "ok", "bot": "blockquote-panel", "alias": VERCEL_URL}
+
 
 @app.get("/setwebhook")
 async def set_webhook(secret: str = ""):
@@ -368,6 +357,7 @@ async def set_webhook(secret: str = ""):
         url += f"?x-vercel-protection-bypass={BYPASS_SECRET}"
     await tg_app.bot.set_webhook(url)
     return {"webhook": url, "status": "set"}
+
 
 @app.post("/{secret}")
 async def webhook(secret: str, request: Request):
