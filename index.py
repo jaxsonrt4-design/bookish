@@ -2,10 +2,12 @@ import os
 import re
 import io
 import csv
+import json
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
+from urllib.parse import urlparse, parse_qsl, urlencode
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
@@ -27,22 +29,8 @@ VERCEL_URL = (
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("panel-bot")
 
-PANEL_PATHS = ["", "All_User", "All_Users", "users", "online", "active", "devices", "clients"]
-
-# Phone field names — case-insensitive, underscore/space stripped
-PHONE_KEYS = {
-    "number", "phone", "phonenumber", "mobile", "mobilenumber",
-    "phonenumber", "mobilenumber", "contact", "msisdn", "tel", "simnumber",
-}
-
-# STRICT: only these exact key names (lowercased, stripped) count as online flag
-STRICT_ONLINE_KEYS = {"online", "isonline"}
-
-# STRICT: only these values count as "true online"
-STRICT_ONLINE_VALUES = {"true", "1", "yes", "online"}
-
-# Skip these as user containers during walk
-SKIP_KEYS = {"alluser", "allusers", "count", "total", "config", "settings", "stats", "meta"}
+# Panel paths to try in order — "clients" is the primary one from GOD 24/7 panels
+PANEL_PATHS = ["clients", "users", "devices", "online"]
 
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
@@ -50,6 +38,7 @@ tg_app = Application.builder().token(BOT_TOKEN).build()
 async def lifespan(app: FastAPI):
     await tg_app.initialize()
     await tg_app.start()
+    logger.info("PTB started. Alias: %s", VERCEL_URL)
     yield
     await tg_app.stop()
     await tg_app.shutdown()
@@ -57,43 +46,32 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STRICT online check — top-level only, exact key + value
+# URL splitter — preserves auth key, strips known paths
 # ─────────────────────────────────────────────────────────────────────────────
-def is_online_strict(node) -> bool:
-    """Only true when node has key `online`/`isOnline` at TOP LEVEL with truthy value."""
-    if not isinstance(node, dict):
-        return False
-    for k, v in node.items():
-        kl = str(k).lower().replace("_", "").replace("-", "").replace(" ", "")
-        if kl in STRICT_ONLINE_KEYS:
-            if v is True or v == 1:
-                return True
-            if isinstance(v, str) and v.lower().strip() in STRICT_ONLINE_VALUES:
-                return True
-            if isinstance(v, int) and v > 0:
-                return True
-    return False
+def split_url(raw: str):
+    u = urlparse(raw.strip())
+    query = dict(parse_qsl(u.query))
+    path = (u.path or "").rstrip("/")
+    if path.endswith(".json"):
+        path = path[:-5]
+    for known in ("/clients", "/users", "/devices", "/online"):
+        if path.endswith(known):
+            path = path[: -len(known)]
+            break
+    base = f"{u.scheme}://{u.netloc}{path}".rstrip("/")
+    return base, query
+
+
+def build_endpoint(base: str, path: str, query: dict):
+    url = f"{base}/{path}.json" if path else f"{base}/.json"
+    if query:
+        url += "?" + urlencode(query)
+    return url
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phone extraction from a device node — recursive inside the node only
+# Indian phone normalization
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_phones(node, found, depth=0):
-    if depth > 6:
-        return
-    if isinstance(node, dict):
-        for k, v in node.items():
-            kl = str(k).lower().replace("_", "").replace("-", "").replace(" ", "")
-            if kl in PHONE_KEYS and isinstance(v, (str, int)) and not isinstance(v, bool):
-                n = normalize_indian(v)
-                if n:
-                    found.add(n)
-            elif isinstance(v, (dict, list)):
-                extract_phones(v, found, depth + 1)
-    elif isinstance(node, list):
-        for item in node:
-            extract_phones(item, found, depth + 1)
-
-def normalize_indian(raw):
+def normalize_indian(raw) -> str | None:
     raw = str(raw).strip()
     if not raw:
         return None
@@ -121,68 +99,121 @@ def normalize_indian(raw):
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Walk users at one level of the tree
+# Status check — matches panel's `!!S.status`
 # ─────────────────────────────────────────────────────────────────────────────
-def walk_users(data, phones, samples, stats):
-    """For each direct child dict that looks like a user, gate on strict online."""
-    if not isinstance(data, dict):
-        return
-    for uid, node in data.items():
-        if not isinstance(node, dict):
-            continue
-        ukl = str(uid).lower().replace("_", "").replace(" ", "")
-        if ukl in SKIP_KEYS:
-            continue
-
-        stats["total_devices"] += 1
-        online = is_online_strict(node)
-        if online:
-            stats["online_devices"] += 1
-            before = len(phones)
-            extract_phones(node, phones)
-            if len(phones) > before:
-                stats["devices_with_number"] += 1
-            if len(samples) < 2:
-                samples.append((uid, dict(node)))
+def is_online(device) -> bool:
+    if not isinstance(device, dict):
+        return False
+    status = device.get("status")
+    if status is True or status == 1:
+        return True
+    if isinstance(status, str) and status.lower().strip() in ("true", "1", "online"):
+        return True
+    return False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Firebase fetch
+# Phone extraction — mobNo first, then sims[0].phoneNumber
 # ─────────────────────────────────────────────────────────────────────────────
-async def fetch_path(session, base, path):
-    url = f"{base}/{path}.json" if path else f"{base}/.json"
+def get_device_phone(device) -> str | None:
+    phone = device.get("mobNo")
+    if phone and str(phone).strip():
+        return str(phone).strip()
+
+    sims = device.get("sims")
+    if isinstance(sims, list) and sims:
+        s0 = sims[0]
+        if isinstance(s0, dict):
+            pn = s0.get("phoneNumber")
+            if pn and str(pn).strip():
+                return str(pn).strip()
+    elif isinstance(sims, dict):
+        for sim in sims.values():
+            if isinstance(sim, dict):
+                pn = sim.get("phoneNumber")
+                if pn and str(pn).strip():
+                    return str(pn).strip()
+
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fetch JSON
+# ─────────────────────────────────────────────────────────────────────────────
+async def fetch_json(session, url: str):
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
-                return None
-            return await r.json(content_type=None)
-    except Exception:
-        return None
+                return None, f"HTTP {r.status}"
+            text = await r.text()
+            if not text or text == "null":
+                return None, "empty"
+            try:
+                return json.loads(text), None
+            except json.JSONDecodeError:
+                return None, "invalid json"
+    except asyncio.TimeoutError:
+        return None, "timeout"
+    except Exception as e:
+        return None, str(e)
 
-async def scan_panel(session, url):
-    base = url.rstrip("/").replace(".json", "")
-    results = await asyncio.gather(*[fetch_path(session, base, p) for p in PANEL_PATHS])
+# ─────────────────────────────────────────────────────────────────────────────
+# Scan one panel
+# ─────────────────────────────────────────────────────────────────────────────
+async def scan_panel(session, raw_url: str):
+    base, query = split_url(raw_url)
 
-    phones = set()
-    samples = []
-    stats = {"total_devices": 0, "online_devices": 0, "devices_with_number": 0}
-    data_present = False
+    data = None
+    used_path = None
+    last_err = None
 
-    for data in results:
-        if not data:
+    for path in PANEL_PATHS:
+        endpoint = build_endpoint(base, path, query)
+        d, err = await fetch_json(session, endpoint)
+        if isinstance(d, dict) and len(d) > 0:
+            data = d
+            used_path = path
+            break
+        last_err = err
+
+    if data is None:
+        return {
+            "url": raw_url,
+            "phones": [],
+            "count": 0,
+            "total": 0,
+            "online": 0,
+            "error": last_err or "no data on any path",
+            "path": None,
+        }
+
+    online_phones = set()
+    total = 0
+    online = 0
+
+    for device_id, device in data.items():
+        if not isinstance(device, dict):
             continue
-        data_present = True
-        walk_users(data, phones, samples, stats)
+        total += 1
+        if not is_online(device):
+            continue
+        online += 1
+        phone = get_device_phone(device)
+        if phone:
+            n = normalize_indian(phone)
+            if n:
+                online_phones.add(n)
 
     return {
-        "url": url,
-        "phones": sorted(phones),
-        "count": len(phones),
-        "samples": samples,
-        "stats": stats,
-        "data_present": data_present,
+        "url": raw_url,
+        "phones": sorted(online_phones),
+        "count": len(online_phones),
+        "total": total,
+        "online": online,
+        "error": None,
+        "path": used_path,
     }
 
-async def scan_all(urls):
+
+async def scan_all(urls: list[str]):
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(*[scan_panel(session, u) for u in urls])
     per_url = {r["url"]: r for r in results}
@@ -211,11 +242,13 @@ def escape(t):
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = (
-        "<b>ONLINE INDIAN EXTRACTOR (STRICT)</b>\n"
-        "<i>only devices with explicit Online flag · +91 only</i>\n\n"
+        "<b>ONLINE INDIAN NUMBER EXTRACTOR</b>\n"
+        "<i>panel-native · status:true · mobNo only</i>\n\n"
         "Paste Firebase panel URL(s), one per line.\n"
-        "I check each device for a literal <code>Online: true</code> field.\n\n"
-        "Debug dump shows how many devices / how many online / how many with numbers."
+        "Include <code>?auth=KEY</code> if the panel needs it.\n\n"
+        "I read the <code>clients</code> node, keep only devices\n"
+        "with <code>status: true</code>, extract their <code>mobNo</code>\n"
+        "or <code>sims[0].phoneNumber</code>, and filter to valid +91."
     )
     await send_rich(context, update.effective_chat.id, html, menu_keyboard())
 
@@ -233,43 +266,38 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text or ""
     urls = URL_RE.findall(text)
+
     if not urls:
-        await context.bot.send_message(chat_id, "No URLs found. Send Firebase panel URL(s), one per line.")
+        await context.bot.send_message(chat_id, "No URLs found. Send panel URL(s), one per line.")
         return
 
-    ack = await context.bot.send_message(chat_id, f"Strict scan: <b>{len(urls)}</b> panel(s)…", parse_mode=ParseMode.HTML)
+    ack = await context.bot.send_message(
+        chat_id, f"Scanning <b>{len(urls)}</b> panel(s)…", parse_mode=ParseMode.HTML,
+    )
+
     result = await scan_all(urls)
 
     lines = [
-        "<b>SCAN COMPLETE (STRICT)</b>",
+        "<b>SCAN COMPLETE</b>",
         f"<b>Panels:</b> {len(urls)}",
         f"<b>Online Indian numbers:</b> <b>{result['count']}</b>",
         "",
     ]
     for u, r in result["per_url"].items():
-        short = u.replace("https://", "").replace(".firebaseio.com", "")
+        short = u.replace("https://", "").split("?")[0].replace(".firebaseio.com", "")
         lines.append(f"• <code>{escape(short)}</code> → <b>{r['count']}</b>")
-        s = r["stats"]
-        lines.append(
-            f"   <i>devices: {s['total_devices']} · online: {s['online_devices']} · with number: {s['devices_with_number']}</i>"
-        )
+        if r["error"]:
+            lines.append(f"   <i>error: {escape(r['error'])}</i>")
+        else:
+            lines.append(
+                f"   <i>devices: {r['total']} · online: {r['online']} · valid +91: {r['count']}</i>"
+            )
 
     if result["count"]:
         lines.append("")
         lines.append("<b>Sample (first 10):</b>")
         for n in result["unique"][:10]:
             lines.append(f"• <code>{escape(n)}</code>")
-
-    # Debug: show first matched device
-    for u, r in result["per_url"].items():
-        if r["samples"]:
-            uid, node = r["samples"][0]
-            lines.append("")
-            lines.append(f"<b>First matched device</b> <code>{escape(uid)}</code>:")
-            for kk, vv in list(node.items())[:15]:
-                sv = str(vv)[:50]
-                lines.append(f"  <code>{escape(kk)}</code> = <i>{escape(sv)}</i>")
-            break
 
     try:
         await ack.delete()
@@ -285,9 +313,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scanned_at = datetime.utcnow().isoformat()
         for n in result["unique"]:
             w.writerow([n, scanned_at])
-        filename = f"online_indian_strict_{ts}.csv"
+        filename = f"online_indian_{ts}.csv"
         doc = InputFile(io.BytesIO(buf.getvalue().encode("utf-8")), filename=filename, mime_type="text/csv")
-        await context.bot.send_document(chat_id=chat_id, document=doc, caption=f"<b>{result['count']}</b> online Indian numbers · {filename}", parse_mode=ParseMode.HTML)
+        await context.bot.send_document(
+            chat_id=chat_id, document=doc,
+            caption=f"<b>{result['count']}</b> online Indian numbers · {filename}",
+            parse_mode=ParseMode.HTML,
+        )
 
 tg_app.add_handler(CommandHandler("start", cmd_start))
 tg_app.add_handler(CommandHandler("help", cmd_help))
@@ -297,7 +329,7 @@ tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "strict-extractor", "alias": VERCEL_URL}
+    return {"status": "ok", "bot": "panel-native", "alias": VERCEL_URL}
 
 @app.get("/setwebhook")
 async def set_webhook(secret: str = ""):
