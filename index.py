@@ -33,7 +33,6 @@ logger = logging.getLogger("panel-bot")
 
 PANEL_PATHS = ["clients", "users", "devices"]
 MAX_DISPLAY_NUMBERS = 1000
-OTP_PATTERN = re.compile(r"\b(\d{4,6})\b")
 
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
@@ -49,7 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URL & phone utilities
+# URL helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def split_url(raw: str):
     u = urlparse(raw.strip())
@@ -71,7 +70,9 @@ def build_endpoint(base: str, path: str, query: dict):
         url += "?" + urlencode(query)
     return url
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Phone normalization
+# ─────────────────────────────────────────────────────────────────────────────
 def normalize_indian(raw) -> str | None:
     raw = str(raw).strip()
     if not raw:
@@ -99,7 +100,9 @@ def normalize_indian(raw) -> str | None:
             return "+91" + local
     return None
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Device parsing
+# ─────────────────────────────────────────────────────────────────────────────
 def is_online(device) -> bool:
     if not isinstance(device, dict):
         return False
@@ -116,12 +119,12 @@ def get_device_phone(device) -> str | None:
     if phone and str(phone).strip():
         return str(phone).strip()
     sims = device.get("sims")
-    if isinstance(sims, list) and sims:
-        s0 = sims[0]
-        if isinstance(s0, dict):
-            pn = s0.get("phoneNumber")
-            if pn and str(pn).strip():
-                return str(pn).strip()
+    if isinstance(sims, list):
+        for sim in sims:
+            if isinstance(sim, dict):
+                pn = sim.get("phoneNumber")
+                if pn and str(pn).strip():
+                    return str(pn).strip()
     elif isinstance(sims, dict):
         for sim in sims.values():
             if isinstance(sim, dict):
@@ -131,36 +134,8 @@ def get_device_phone(device) -> str | None:
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Live OTP fetcher
+# Fetch
 # ─────────────────────────────────────────────────────────────────────────────
-async def fetch_recent_otps(session, base: str, query: dict, device_id: str, limit: int = 3):
-    """Fetches the last N messages for a device and extracts OTPs."""
-    endpoint = build_endpoint(base, f"messages/{device_id}", query)
-    data, err = await fetch_json(session, endpoint)
-    if not data or not isinstance(data, dict):
-        return []
-
-    msgs = []
-    for key, val in data.items():
-        if not isinstance(val, dict):
-            continue
-        text = str(val.get("message") or val.get("body") or val.get("text") or "")
-        if not text:
-            continue
-        otp_match = OTP_PATTERN.search(text)
-        if otp_match:
-            msgs.append({
-                "otp": otp_match.group(1),
-                "sender": str(val.get("sender") or val.get("from") or "Unknown"),
-                "time": str(val.get("dateTime") or val.get("date") or ""),
-                "text": text[:120],
-            })
-
-    # Sort newest first (Firebase keys are usually time-ordered)
-    msgs.sort(key=lambda x: x["time"], reverse=True)
-    return msgs[:limit]
-
-
 async def fetch_json(session, url: str):
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
@@ -179,7 +154,7 @@ async def fetch_json(session, url: str):
         return None, str(e)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scan engine (unchanged core logic)
+# Scan
 # ─────────────────────────────────────────────────────────────────────────────
 async def scan_panel(session, raw_url: str):
     base, query = split_url(raw_url)
@@ -203,7 +178,6 @@ async def scan_panel(session, raw_url: str):
             "online": 0, "error": last_err or "no data", "path": None,
         }
 
-    devices = []
     online_phones = set()
     total = 0
     online = 0
@@ -212,33 +186,24 @@ async def scan_panel(session, raw_url: str):
         if not isinstance(device, dict):
             continue
         total += 1
-        online_flag = is_online(device)
+        if not is_online(device):
+            continue
+        online += 1
         phone = get_device_phone(device)
-
-        devices.append({
-            "id": device_id,
-            "name": device.get("model") or device.get("modelName") or device_id,
-            "phone": phone,
-            "online": online_flag,
-            "battery": device.get("battery"),
-        })
-
-        if online_flag:
-            online += 1
-            if phone:
-                n = normalize_indian(phone)
-                if n:
-                    online_phones.add(n)
+        if phone:
+            n = normalize_indian(phone)
+            if n:
+                online_phones.add(n)
 
     return {
         "url": raw_url, "base": base, "query": query,
-        "devices": devices, "phones": sorted(online_phones),
+        "devices": [], "phones": sorted(online_phones),
         "count": len(online_phones), "total": total, "online": online,
         "error": None, "path": used_path,
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rich message helpers (raw API)
+# Rich helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def esc(t) -> str:
     return html_lib.escape(str(t), quote=False)
@@ -252,7 +217,6 @@ async def rich_send(context, chat_id: int, html: str, keyboard=None):
     api_kwargs = {"chat_id": chat_id, "rich_message": {"html": html}}
     if keyboard is not None:
         api_kwargs["reply_markup"] = keyboard
-
     try:
         return await context.bot.do_api_request(
             endpoint="sendRichMessage",
@@ -289,13 +253,15 @@ async def draft(context, chat_id: int, draft_id: int, html: str):
         logger.debug("sendRichMessageDraft failed: %s", exc)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Report builder (enhanced UI + OTP)
+# Report
 # ─────────────────────────────────────────────────────────────────────────────
-def build_report(result, otp_results: dict) -> str:
+def build_report(result) -> str:
     p = []
     p.append("<h2>📊 Scan Report</h2>")
-    p.append(f"<p><b>Panels scanned:</b> {len(result['per_url'])}</p>")
-    p.append(f"<p><b>Total unique numbers:</b> <mark>{result['count']}</mark></p>")
+    p.append("<table bordered striped>")
+    p.append(f"<tr><td>Panels scanned</td><td><b>{len(result['per_url'])}</b></td></tr>")
+    p.append(f"<tr><td>Unique +91 numbers</td><td><mark><b>{result['count']}</b></mark></td></tr>")
+    p.append("</table>")
     p.append("<hr/>")
 
     for url, r in result["per_url"].items():
@@ -307,18 +273,16 @@ def build_report(result, otp_results: dict) -> str:
             p.append("<hr/>")
             continue
 
-        # Stats table
         p.append("<table bordered striped>")
         p.append(f"<tr><td>Numbers</td><td><b>{r['count']}</b></td></tr>")
         p.append(f"<tr><td>Online</td><td>{r['online']}</td></tr>")
         p.append(f"<tr><td>Devices</td><td>{r['total']}</td></tr>")
         p.append("</table>")
 
-        # Collapsible number list
         if r["phones"]:
             shown = r["phones"][:MAX_DISPLAY_NUMBERS]
             extra = len(r["phones"]) - len(shown)
-            header = f"📱 Show all {r['count']} numbers"
+            header = f"📱 View {r['count']} numbers"
             if extra > 0:
                 header += f" (first {MAX_DISPLAY_NUMBERS})"
             body = "\n".join(f"<li>{esc(n)}</li>" for n in shown)
@@ -327,51 +291,51 @@ def build_report(result, otp_results: dict) -> str:
             p.append(f"<ul>{body}</ul>")
             p.append("</details>")
         else:
-            p.append("<p><i>No valid +91 numbers.</i></p>")
-
-        # OTP block
-        otps = otp_results.get(url, [])
-        if otps:
-            p.append("<h4>🔑 Recent OTPs</h4>")
-            p.append("<details open>")
-            p.append(f"<summary>Show {len(otps)} OTP(s)</summary>")
-            p.append("<ul>")
-            for o in otps:
-                p.append(f"<li><b>{esc(o['otp'])}</b> — <i>{esc(o['sender'])}</i> · {esc(o['time'][:16])}</li>")
-            p.append("</ul>")
-            p.append("</details>")
-        else:
-            p.append("<blockquote>No OTPs found in recent messages.</blockquote>")
+            p.append("<p><i>No valid +91 numbers found.</i></p>")
 
         p.append("<hr/>")
 
-    p.append(f"<footer><i>Scanned {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</i></footer>")
+    p.append(
+        "<footer>"
+        f"<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</i> · "
+        "<i>by <a href=\"https://t.me/arsh3\">@arsh3</a></i>"
+        "</footer>"
+    )
     return "\n".join(p)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Handlers
 # ─────────────────────────────────────────────────────────────────────────────
 def menu_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📖 How to scan", callback_data="help")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👨‍💻 Owner", url="https://t.me/arsh3")],
+        [InlineKeyboardButton("📖 Documentation", callback_data="help")],
+    ])
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = (
-        "<h2>📡 Panel Number & OTP Extractor</h2>"
-        "<p><i>Rich UI · live OTPs · +91 only</i></p>"
+        "<h2>📡 Panel Number Extractor</h2>"
+        "<p><i>Extracts online +91 numbers from Firebase panels.</i></p>"
         "<hr/>"
-        "<p>Paste Firebase panel URL(s), one per line.</p>"
-        "<p>Include <code>?auth=KEY</code> if needed.</p>"
-        "<hr/>"
-        "<p><b>Features:</b></p>"
+        "<h3>Usage</h3>"
         "<ul>"
-        "<li>Reads <code>clients</code> node</li>"
-        "<li>Keeps devices with <code>status: true</code></li>"
-        "<li>Extracts <code>mobNo</code> / <code>sims[0].phoneNumber</code></li>"
-        "<li>Fetches <b>live OTPs</b> from <code>messages</code> node</li>"
-        "<li>Filters valid <b>+91</b></li>"
+        "<li>Send one or more Firebase panel URLs — one per line.</li>"
+        "<li>Append <code>?auth=KEY</code> if the panel requires a secret.</li>"
+        "<li>Results arrive in a collapsible rich report + CSV export.</li>"
         "</ul>"
-        "<p>Numbers and OTPs appear under each link in <b>tap-to-expand</b> blocks.</p>"
+        "<h3>Process</h3>"
+        "<ul>"
+        "<li>Reads the <code>clients</code> node.</li>"
+        "<li>Keeps devices where <code>status: true</code>.</li>"
+        "<li>Extracts <code>mobNo</code> or first available <code>sims[].phoneNumber</code>.</li>"
+        "<li>Filters to valid Indian mobile numbers.</li>"
+        "</ul>"
+        "<hr/>"
+        "<footer>"
+        "<b>Developer:</b> <a href=\"https://t.me/arsh3\">@arsh3</a>\n"
+        "<i>No accounts. No tracking. No logs.</i>"
+        "</footer>"
     )
     await rich_send(context, update.effective_chat.id, html, menu_keyboard())
 
@@ -390,74 +354,60 @@ URL_RE = re.compile(r"https?://[^\s\)\]\>,]+", re.IGNORECASE)
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    text = update.message.text or ""
+    text = (update.message.text or "").strip()
     urls = URL_RE.findall(text)
 
     if not urls:
-        await rich_send(context, chat_id, "<p>No URLs found. Send panel URL(s), one per line.</p>")
+        await rich_send(
+            context, chat_id,
+            "<blockquote>No URLs detected. Send Firebase panel URL(s), one per line.</blockquote>"
+        )
         return
 
     did = new_draft_id()
 
-    # Loading animation: same draft_id = smooth in-place updates
-    await draft(context, chat_id, did,
+    await draft(
+        context, chat_id, did,
         f"<h2>⏳ Scanning {len(urls)} panel(s)…</h2>"
-        f"<p><i>Connecting to Firebase…</i></p>"
+        f"<p><i>Establishing connection…</i></p>"
     )
 
     try:
-        await asyncio.sleep(0.4)
-        await draft(context, chat_id, did,
+        await asyncio.sleep(0.35)
+        await draft(
+            context, chat_id, did,
             f"<h2>🔍 Fetching devices…</h2>"
             f"<p><i>Reading clients node…</i></p>"
         )
 
         async with aiohttp.ClientSession() as session:
             results = await asyncio.gather(*[scan_panel(session, u) for u in urls])
-            per_url = {r["url"]: r for r in results}
-            global_unique = set()
-            for r in results:
-                global_unique.update(r["phones"])
 
-            await draft(context, chat_id, did,
-                f"<h2>📱 Extracting numbers…</h2>"
-                f"<p><i>{len(global_unique)} valid +91 found</i></p>"
-            )
-
-            # Fetch OTPs for online devices (limit to 5 devices per panel to keep it fast)
-            otp_results = {}
-            for r in results:
-                if r["error"]:
-                    continue
-                otps = []
-                online_devices = [d for d in r["devices"] if d["online"]][:5]
-                for dev in online_devices:
-                    dev_otps = await fetch_recent_otps(session, r["base"], r["query"], dev["id"], limit=2)
-                    otps.extend(dev_otps)
-                otp_results[r["url"]] = otps[:5]
-
+        per_url = {r["url"]: r for r in results}
+        global_unique = set()
+        for r in results:
+            global_unique.update(r["phones"])
         result = {"per_url": per_url, "unique": sorted(global_unique), "count": len(global_unique)}
 
-        await draft(context, chat_id, did,
-            f"<h2>🔑 Fetching OTPs…</h2>"
-            f"<p><i>Scanning messages…</i></p>"
+        await draft(
+            context, chat_id, did,
+            f"<h2>📱 Extracting numbers…</h2>"
+            f"<p><i>{result['count']} valid +91 found</i></p>"
         )
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.2)
 
     except Exception as exc:
         logger.exception("scan failed: %s", exc)
         await rich_send(context, chat_id, f"<blockquote>⚠️ Scan failed: <code>{esc(exc)}</code></blockquote>")
         return
 
-    # Final rich report
-    report = build_report(result, otp_results)
+    report = build_report(result)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh OTPs", callback_data="refresh_otp")],
-        [InlineKeyboardButton("📖 Help", callback_data="help")],
+        [InlineKeyboardButton("👨‍💻 Owner", url="https://t.me/arsh3")],
+        [InlineKeyboardButton("📖 Documentation", callback_data="help")],
     ])
     await rich_send(context, chat_id, report, kb)
 
-    # CSV
     if result["count"]:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         buf = io.StringIO()
@@ -466,7 +416,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scanned_at = datetime.utcnow().isoformat()
         for n in result["unique"]:
             w.writerow([n, scanned_at])
-        filename = f"online_indian_{ts}.csv"
+        filename = f"numbers_{ts}.csv"
         doc = InputFile(io.BytesIO(buf.getvalue().encode("utf-8")), filename=filename, mime_type="text/csv")
         await context.bot.send_document(
             chat_id=chat_id, document=doc,
@@ -474,24 +424,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Callback for OTP refresh (optional: you can re-run scan logic here)
-# ─────────────────────────────────────────────────────────────────────────────
-async def refresh_otp_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer("Re-scan the panel to refresh OTPs.")
-    # For simplicity, just acknowledge. A full re-scan would require storing the last URL.
-
 tg_app.add_handler(CommandHandler("start", cmd_start))
 tg_app.add_handler(CommandHandler("help", cmd_help))
 tg_app.add_handler(CallbackQueryHandler(help_cb, pattern="^help$"))
-tg_app.add_handler(CallbackQueryHandler(refresh_otp_cb, pattern="^refresh_otp$"))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "rich-otp-v4", "alias": VERCEL_URL}
+    return {"status": "ok"}
 
 @app.get("/setwebhook")
 async def set_webhook(secret: str = ""):
