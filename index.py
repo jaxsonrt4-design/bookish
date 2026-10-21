@@ -13,7 +13,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
@@ -32,7 +32,7 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger("panel-bot")
 
 PANEL_PATHS = ["clients", "users", "devices", "online"]
-MAX_DISPLAY_NUMBERS = 2000  # rich message safety cap
+MAX_DISPLAY_NUMBERS = 2000
 
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
@@ -198,7 +198,7 @@ async def scan_all(urls: list[str]):
     return {"per_url": per_url, "unique": sorted(global_unique), "count": len(global_unique)}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RICH HELPERS
+# RICH SEND — via raw Bot API (PTB has no typed method yet)
 # ─────────────────────────────────────────────────────────────────────────────
 def esc(t) -> str:
     return html_lib.escape(str(t), quote=False)
@@ -208,46 +208,56 @@ def new_draft_id() -> int:
     return int(time.time() * 1000) % 2147483647 or 1
 
 
+async def rich_send(context, chat_id: int, html: str, keyboard=None):
+    """Final persistent rich message via raw Bot API."""
+    api_kwargs = {
+        "chat_id": chat_id,
+        "rich_message": {"html": html},
+    }
+    if keyboard is not None:
+        api_kwargs["reply_markup"] = keyboard
+
+    try:
+        return await context.bot.do_api_request(
+            endpoint="sendRichMessage",
+            api_kwargs=api_kwargs,
+            return_type=Message,
+        )
+    except Exception as exc:
+        logger.warning("sendRichMessage failed (%s) — falling back to classic HTML", exc)
+        # Fallback: classic send_message with supported HTML only
+        safe_html = re.sub(r"</?(?:h[1-6]|details|summary|table|tr|td|th|mark|hr|footer|ul|li)[^>]*>", "", html)
+        try:
+            return await context.bot.send_message(
+                chat_id=chat_id,
+                text=safe_html[:4000],
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except Exception as exc2:
+            logger.exception("classic fallback also failed: %s", exc2)
+            plain = re.sub(r"<[^>]+>", "", html)
+            return await context.bot.send_message(chat_id=chat_id, text=plain[:4000])
+
+
 async def draft(context, chat_id: int, draft_id: int, html: str):
     """Native animated draft. Same draft_id = smooth in-place update."""
     try:
-        await context.bot.send_rich_message_draft(
-            chat_id=chat_id,
-            draft_id=draft_id,
-            rich_message={"html": html},
-        )
-    except AttributeError:
-        # older PTB — fall back to text draft
-        try:
-            plain = re.sub(r"<[^>]+>", "", html)
-            await context.bot.send_message_draft(chat_id=chat_id, draft_id=draft_id, text=plain[:4000])
-        except Exception:
-            pass
-    except Exception as exc:
-        logger.debug("draft failed: %s", exc)
-
-
-async def rich_send(context, chat_id: int, html: str, keyboard=None):
-    """Final persistent rich message."""
-    try:
-        return await context.bot.send_rich_message(
-            chat_id=chat_id,
-            rich_message={"html": html},
-            reply_markup=keyboard,
-        )
-    except AttributeError:
-        logger.warning("send_rich_message missing — classic fallback")
-        return await context.bot.send_message(
-            chat_id=chat_id, text=html, parse_mode=ParseMode.HTML,
-            reply_markup=keyboard, disable_web_page_preview=True,
+        await context.bot.do_api_request(
+            endpoint="sendRichMessageDraft",
+            api_kwargs={
+                "chat_id": chat_id,
+                "draft_id": draft_id,
+                "rich_message": {"html": html},
+            },
         )
     except Exception as exc:
-        logger.exception("send_rich_message failed: %s", exc)
-        plain = re.sub(r"<[^>]+>", "", html)
-        return await context.bot.send_message(chat_id=chat_id, text=plain[:4000])
+        logger.debug("sendRichMessageDraft failed: %s", exc)
+        # silent skip — draft is optional
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REPORT BUILDER — rich UI
+# REPORT BUILDER — rich HTML
 # ─────────────────────────────────────────────────────────────────────────────
 def build_report(result) -> str:
     p = []
@@ -343,7 +353,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     did = new_draft_id()
 
-    # ── loading animation: same draft_id = animated in-place ──────────────
     await draft(context, chat_id, did,
         f"<h2>⏳ Scanning {len(urls)} panel(s)…</h2>"
         f"<p><i>Connecting to Firebase…</i></p>"
@@ -369,11 +378,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rich_send(context, chat_id, f"<blockquote>⚠️ Scan failed: <code>{esc(exc)}</code></blockquote>")
         return
 
-    # ── final rich report ─────────────────────────────────────────────────
     report = build_report(result)
     await rich_send(context, chat_id, report)
 
-    # ── CSV ──────────────────────────────────────────────────────────────
     if result["count"]:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         buf = io.StringIO()
@@ -398,7 +405,7 @@ tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "rich-ui-v2", "alias": VERCEL_URL}
+    return {"status": "ok", "bot": "raw-rich-v3", "alias": VERCEL_URL}
 
 
 @app.get("/setwebhook")
