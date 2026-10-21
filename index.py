@@ -21,10 +21,8 @@ from telegram.ext import (
 # ─────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme-now")
+BYPASS_SECRET = os.environ.get("VERCEL_AUTOMATION_BYPASS_SECRET", "")
 
-# Vercel's stable production alias — NEVER the hashed deployment URL.
-# VERCEL_PROJECT_PRODUCTION_URL is the env var Vercel sets to the alias.
-# VERCEL_URL (do NOT use) is the per-deployment hash.
 VERCEL_URL = (
     os.environ.get("VERCEL_PROJECT_PRODUCTION_URL")
     or os.environ.get("VERCEL_BRANCH_URL")
@@ -46,7 +44,7 @@ tg_app = Application.builder().token(BOT_TOKEN).build()
 async def lifespan(app: FastAPI):
     await tg_app.initialize()
     await tg_app.start()
-    logger.info("PTB started. Production alias: %s", VERCEL_URL)
+    logger.info("PTB started. Alias: %s | bypass: %s", VERCEL_URL, "yes" if BYPASS_SECRET else "no")
     yield
     await tg_app.stop()
     await tg_app.shutdown()
@@ -177,7 +175,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for n in result["unique"][:10]:
             lines.append(f"• <code>{n}</code>")
 
-    await ack.delete()
+    try:
+        await ack.delete()
+    except Exception:
+        pass
     await send_rich(context, chat_id, "\n".join(lines))
 
     if result["count"]:
@@ -212,14 +213,23 @@ tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "panel-scanner", "alias": VERCEL_URL}
+    return {
+        "status": "ok",
+        "bot": "panel-scanner",
+        "alias": VERCEL_URL,
+        "bypass": bool(BYPASS_SECRET),
+    }
 
 
 @app.get("/setwebhook")
 async def set_webhook(secret: str = ""):
     if secret != WEBHOOK_SECRET:
         return Response(status_code=403)
+
     webhook_url = f"https://{VERCEL_URL}/{WEBHOOK_SECRET}"
+    if BYPASS_SECRET:
+        webhook_url += f"?x-vercel-protection-bypass={BYPASS_SECRET}"
+
     await tg_app.bot.set_webhook(webhook_url)
     return {"webhook": webhook_url, "status": "set"}
 
@@ -228,7 +238,14 @@ async def set_webhook(secret: str = ""):
 async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         return Response(status_code=403)
+
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
-    asyncio.create_task(tg_app.process_update(update))
+    logger.info("update received: %s", update.update_id)
+
+    try:
+        await tg_app.process_update(update)
+    except Exception as exc:
+        logger.exception("process_update failed: %s", exc)
+
     return Response(status_code=200)
