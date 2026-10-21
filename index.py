@@ -4,6 +4,7 @@ import io
 import csv
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 import aiohttp
@@ -20,9 +21,17 @@ from telegram.ext import (
 # ─────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme-now")
-VERCEL_URL = os.environ.get("VERCEL_URL", "")
 
-logging.basicConfig(level=logging.INFO)
+# Vercel's stable production alias — NEVER the hashed deployment URL.
+# VERCEL_PROJECT_PRODUCTION_URL is the env var Vercel sets to the alias.
+# VERCEL_URL (do NOT use) is the per-deployment hash.
+VERCEL_URL = (
+    os.environ.get("VERCEL_PROJECT_PRODUCTION_URL")
+    or os.environ.get("VERCEL_BRANCH_URL")
+    or "bookish-theta-two.vercel.app"
+).replace("https://", "").replace("http://", "").rstrip("/")
+
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("panel-bot")
 
 PANEL_PATHS = [
@@ -30,22 +39,24 @@ PANEL_PATHS = [
     "sms", "otps", "allattk", "data", "victims",
 ]
 
-app = FastAPI()
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
-_initialized = False
-_init_lock = asyncio.Lock()
 
-async def ensure_init():
-    global _initialized
-    if _initialized:
-        return
-    async with _init_lock:
-        if _initialized:
-            return
-        await tg_app.initialize()
-        _initialized = True
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await tg_app.initialize()
+    await tg_app.start()
+    logger.info("PTB started. Production alias: %s", VERCEL_URL)
+    yield
+    await tg_app.stop()
+    await tg_app.shutdown()
 
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scanning engine
 # ─────────────────────────────────────────────────────────────────────────────
 async def probe_path(session, base, path):
     url = f"{base}/{path}.json?shallow=true" if path else f"{base}/.json?shallow=true"
@@ -62,6 +73,7 @@ async def probe_path(session, base, path):
         pass
     return path, []
 
+
 async def scan_panel(session, url):
     base = url.rstrip("/")
     if base.endswith(".json"):
@@ -72,6 +84,7 @@ async def scan_panel(session, url):
         unique.update(keys)
     return url, sorted(unique)
 
+
 async def scan_all(urls):
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(*[scan_panel(session, u) for u in urls])
@@ -81,11 +94,15 @@ async def scan_all(urls):
         global_unique.update(ids)
     return {"per_url": per_url, "unique": sorted(global_unique), "count": len(global_unique)}
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔥 How to scan", callback_data="help")],
     ])
+
 
 async def send_rich(context, chat_id, html, keyboard=None):
     try:
@@ -97,6 +114,9 @@ async def send_rich(context, chat_id, html, keyboard=None):
             chat_id=chat_id, text=html, parse_mode=ParseMode.HTML, reply_markup=keyboard,
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Handlers
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = (
@@ -110,15 +130,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await send_rich(context, update.effective_chat.id, html, menu_keyboard())
 
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
+
 
 async def help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await cmd_start(update, context)
 
+
 URL_RE = re.compile(r"https?://[^\s\)\]\>,]+", re.IGNORECASE)
+
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -176,33 +200,35 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
+
 tg_app.add_handler(CommandHandler("start", cmd_start))
 tg_app.add_handler(CommandHandler("help", cmd_help))
 tg_app.add_handler(CallbackQueryHandler(help_cb, pattern="^help$"))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Webhook endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "panel-scanner"}
+    return {"status": "ok", "bot": "panel-scanner", "alias": VERCEL_URL}
+
 
 @app.get("/setwebhook")
 async def set_webhook(secret: str = ""):
     if secret != WEBHOOK_SECRET:
         return Response(status_code=403)
-    if not VERCEL_URL:
-        return {"error": "VERCEL_URL not set in env"}
     webhook_url = f"https://{VERCEL_URL}/{WEBHOOK_SECRET}"
-    await ensure_init()
     await tg_app.bot.set_webhook(webhook_url)
     return {"webhook": webhook_url, "status": "set"}
+
 
 @app.post("/{secret}")
 async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         return Response(status_code=403)
-    await ensure_init()
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
+    asyncio.create_task(tg_app.process_update(update))
     return Response(status_code=200)
