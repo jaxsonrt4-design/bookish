@@ -2,7 +2,6 @@ import os
 import re
 import io
 import csv
-import json
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -30,12 +29,19 @@ logger = logging.getLogger("panel-bot")
 
 PANEL_PATHS = ["", "All_User", "All_Users", "users", "online", "active", "devices", "clients"]
 
-PHONE_KEYS = {"number", "phone", "phonenumber", "mobile", "mobilenumber", "phone_number", "mobile_number", "contact", "msisdn", "tel", "sim_number"}
+# Phone field names — case-insensitive, underscore/space stripped
+PHONE_KEYS = {
+    "number", "phone", "phonenumber", "mobile", "mobilenumber",
+    "phonenumber", "mobilenumber", "contact", "msisdn", "tel", "simnumber",
+}
 
-ONLINE_KEYS = {"online", "isonline", "isactive", "active", "live", "isalive", "connected", "isconnected", "status", "state", "connection", "connectionstatus", "presence", "sessionactive", "isloggedin", "loggedin", "onlinestatus"}
+# STRICT: only these exact key names (lowercased, stripped) count as online flag
+STRICT_ONLINE_KEYS = {"online", "isonline"}
 
-ONLINE_VALUES = {"true", "1", "yes", "online", "active", "live", "connected", "on", "alive", "running", "logged_in", "loggedin"}
+# STRICT: only these values count as "true online"
+STRICT_ONLINE_VALUES = {"true", "1", "yes", "online"}
 
+# Skip these as user containers during walk
 SKIP_KEYS = {"alluser", "allusers", "count", "total", "config", "settings", "stats", "meta"}
 
 tg_app = Application.builder().token(BOT_TOKEN).build()
@@ -51,47 +57,41 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Deep online check — recurses into child objects
+# STRICT online check — top-level only, exact key + value
 # ─────────────────────────────────────────────────────────────────────────────
-def is_online_deep(node, depth=0):
-    if depth > 4:
+def is_online_strict(node) -> bool:
+    """Only true when node has key `online`/`isOnline` at TOP LEVEL with truthy value."""
+    if not isinstance(node, dict):
         return False
-    if isinstance(node, dict):
-        for k, v in node.items():
-            kl = str(k).lower().replace("_", "").replace("-", "").replace(" ", "")
-            if kl in ONLINE_KEYS:
-                if v is True or v == 1:
-                    return True
-                if isinstance(v, str) and v.lower().strip() in ONLINE_VALUES:
-                    return True
-            if isinstance(v, (dict, list)) and is_online_deep(v, depth + 1):
+    for k, v in node.items():
+        kl = str(k).lower().replace("_", "").replace("-", "").replace(" ", "")
+        if kl in STRICT_ONLINE_KEYS:
+            if v is True or v == 1:
                 return True
-    elif isinstance(node, list):
-        for item in node:
-            if is_online_deep(item, depth + 1):
+            if isinstance(v, str) and v.lower().strip() in STRICT_ONLINE_VALUES:
+                return True
+            if isinstance(v, int) and v > 0:
                 return True
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Deep phone extraction — only when online context is true
+# Phone extraction from a device node — recursive inside the node only
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_phones_deep(node, found, online_ctx=False, depth=0):
-    if depth > 8:
+def extract_phones(node, found, depth=0):
+    if depth > 6:
         return
     if isinstance(node, dict):
-        node_online = online_ctx or is_online_deep(node)
         for k, v in node.items():
             kl = str(k).lower().replace("_", "").replace("-", "").replace(" ", "")
             if kl in PHONE_KEYS and isinstance(v, (str, int)) and not isinstance(v, bool):
-                if node_online:
-                    n = normalize_indian(v)
-                    if n:
-                        found.add(n)
+                n = normalize_indian(v)
+                if n:
+                    found.add(n)
             elif isinstance(v, (dict, list)):
-                extract_phones_deep(v, found, node_online, depth + 1)
+                extract_phones(v, found, depth + 1)
     elif isinstance(node, list):
         for item in node:
-            extract_phones_deep(item, found, online_ctx, depth + 1)
+            extract_phones(item, found, depth + 1)
 
 def normalize_indian(raw):
     raw = str(raw).strip()
@@ -121,12 +121,37 @@ def normalize_indian(raw):
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Walk users at one level of the tree
+# ─────────────────────────────────────────────────────────────────────────────
+def walk_users(data, phones, samples, stats):
+    """For each direct child dict that looks like a user, gate on strict online."""
+    if not isinstance(data, dict):
+        return
+    for uid, node in data.items():
+        if not isinstance(node, dict):
+            continue
+        ukl = str(uid).lower().replace("_", "").replace(" ", "")
+        if ukl in SKIP_KEYS:
+            continue
+
+        stats["total_devices"] += 1
+        online = is_online_strict(node)
+        if online:
+            stats["online_devices"] += 1
+            before = len(phones)
+            extract_phones(node, phones)
+            if len(phones) > before:
+                stats["devices_with_number"] += 1
+            if len(samples) < 2:
+                samples.append((uid, dict(node)))
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Firebase fetch
 # ─────────────────────────────────────────────────────────────────────────────
 async def fetch_path(session, base, path):
     url = f"{base}/{path}.json" if path else f"{base}/.json"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
                 return None
             return await r.json(content_type=None)
@@ -138,31 +163,23 @@ async def scan_panel(session, url):
     results = await asyncio.gather(*[fetch_path(session, base, p) for p in PANEL_PATHS])
 
     phones = set()
-    first_device = None
-    first_key = None
-    total_raw = 0
+    samples = []
+    stats = {"total_devices": 0, "online_devices": 0, "devices_with_number": 0}
+    data_present = False
 
     for data in results:
         if not data:
             continue
-        total_raw += 1
-        if first_device is None and isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, dict) and len(v) >= 2:
-                    ukl = str(k).lower().replace("_", "")
-                    if ukl not in SKIP_KEYS:
-                        first_device = v
-                        first_key = k
-                        break
-        extract_phones_deep(data, phones)
+        data_present = True
+        walk_users(data, phones, samples, stats)
 
     return {
         "url": url,
         "phones": sorted(phones),
         "count": len(phones),
-        "first_device": first_device,
-        "first_key": first_key,
-        "data_present": total_raw > 0,
+        "samples": samples,
+        "stats": stats,
+        "data_present": data_present,
     }
 
 async def scan_all(urls):
@@ -194,11 +211,11 @@ def escape(t):
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = (
-        "<b>ONLINE INDIAN NUMBER EXTRACTOR</b>\n"
-        "<i>universal extractor · online + +91 only</i>\n\n"
+        "<b>ONLINE INDIAN EXTRACTOR (STRICT)</b>\n"
+        "<i>only devices with explicit Online flag · +91 only</i>\n\n"
         "Paste Firebase panel URL(s), one per line.\n"
-        "I search every depth for <code>Number</code> when <code>Online</code> is true.\n\n"
-        "If 0 found, I dump the first device's raw keys — so we see the real schema."
+        "I check each device for a literal <code>Online: true</code> field.\n\n"
+        "Debug dump shows how many devices / how many online / how many with numbers."
     )
     await send_rich(context, update.effective_chat.id, html, menu_keyboard())
 
@@ -220,11 +237,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id, "No URLs found. Send Firebase panel URL(s), one per line.")
         return
 
-    ack = await context.bot.send_message(chat_id, f"Scanning <b>{len(urls)}</b> panel(s)…", parse_mode=ParseMode.HTML)
+    ack = await context.bot.send_message(chat_id, f"Strict scan: <b>{len(urls)}</b> panel(s)…", parse_mode=ParseMode.HTML)
     result = await scan_all(urls)
 
     lines = [
-        "<b>SCAN COMPLETE</b>",
+        "<b>SCAN COMPLETE (STRICT)</b>",
         f"<b>Panels:</b> {len(urls)}",
         f"<b>Online Indian numbers:</b> <b>{result['count']}</b>",
         "",
@@ -232,24 +249,27 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u, r in result["per_url"].items():
         short = u.replace("https://", "").replace(".firebaseio.com", "")
         lines.append(f"• <code>{escape(short)}</code> → <b>{r['count']}</b>")
+        s = r["stats"]
+        lines.append(
+            f"   <i>devices: {s['total_devices']} · online: {s['online_devices']} · with number: {s['devices_with_number']}</i>"
+        )
 
     if result["count"]:
         lines.append("")
         lines.append("<b>Sample (first 10):</b>")
         for n in result["unique"][:10]:
             lines.append(f"• <code>{escape(n)}</code>")
-    else:
-        for u, r in result["per_url"].items():
-            if r["first_device"]:
-                lines.append("")
-                lines.append(f"<b>RAW DUMP — first device</b> <code>{escape(r['first_key'])}</code>:")
-                for kk, vv in list(r["first_device"].items())[:20]:
-                    sv = str(vv)[:60]
-                    lines.append(f"  <code>{escape(kk)}</code>: {type(vv).__name__} = <i>{escape(sv)}</i>")
-                break
-            elif not r["data_present"]:
-                lines.append("")
-                lines.append(f"⚠️ <code>{escape(u)}</code> returned no data (auth-locked or dead).")
+
+    # Debug: show first matched device
+    for u, r in result["per_url"].items():
+        if r["samples"]:
+            uid, node = r["samples"][0]
+            lines.append("")
+            lines.append(f"<b>First matched device</b> <code>{escape(uid)}</code>:")
+            for kk, vv in list(node.items())[:15]:
+                sv = str(vv)[:50]
+                lines.append(f"  <code>{escape(kk)}</code> = <i>{escape(sv)}</i>")
+            break
 
     try:
         await ack.delete()
@@ -265,7 +285,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scanned_at = datetime.utcnow().isoformat()
         for n in result["unique"]:
             w.writerow([n, scanned_at])
-        filename = f"online_indian_{ts}.csv"
+        filename = f"online_indian_strict_{ts}.csv"
         doc = InputFile(io.BytesIO(buf.getvalue().encode("utf-8")), filename=filename, mime_type="text/csv")
         await context.bot.send_document(chat_id=chat_id, document=doc, caption=f"<b>{result['count']}</b> online Indian numbers · {filename}", parse_mode=ParseMode.HTML)
 
@@ -277,7 +297,7 @@ tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "universal-extractor", "alias": VERCEL_URL}
+    return {"status": "ok", "bot": "strict-extractor", "alias": VERCEL_URL}
 
 @app.get("/setwebhook")
 async def set_webhook(secret: str = ""):
